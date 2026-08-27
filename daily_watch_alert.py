@@ -14,6 +14,7 @@ NOT financial advice. Rule-based signals only, not a guarantee of profit.
 
 import os
 import time
+import json
 import smtplib
 from email.mime.text import MIMEText
 import yfinance as yf
@@ -53,6 +54,33 @@ HOLDINGS_CSV_PATH = "holdings.csv"
 # holding gains at least this much, even if you never set a target price.
 # Also used to suggest a sell price alongside every new BUY signal below.
 DEFAULT_PROFIT_TARGET_PCT = 5
+
+# If a holding doesn't have a specific StopLoss set in holdings.csv, this
+# percentage drop from your buy price triggers an automatic stop-loss
+# alert instead.
+DEFAULT_STOP_LOSS_PCT = 6
+
+# ---- PARTIAL PROFIT BOOKING ----
+# When a holding first reaches DEFAULT_PROFIT_TARGET_PCT profit, instead
+# of a one-time "sell everything" alert, you'll be told to book profit on
+# HALF the position and let the rest ride. The remaining half is then
+# tracked with a trailing stop: if the price falls TRAILING_STOP_PCT from
+# its peak (after the partial sell), you'll get a final alert to exit the
+# rest.
+TRAILING_STOP_PCT = 3
+
+# File used to remember what's already been alerted, so you don't get the
+# same "consider selling" email every single day. This file is updated by
+# the script and committed back to your repo automatically by the
+# workflow - you never need to edit it yourself.
+ALERT_STATE_PATH = "alert_state.json"
+
+# ---- SECTOR / DIVERSIFICATION CHECK ----
+# Warns you if too many of your holdings are concentrated in one industry
+# (e.g. all banking stocks). Uses the Industry column from your NIFTY 500
+# CSV to look up each holding's sector. Set the % that counts as "too
+# concentrated".
+SECTOR_CONCENTRATION_WARNING_PCT = 40
 
 # How many tickers to download from Yahoo Finance at once. Batching avoids
 # rate-limit errors and timeouts that can happen if you request 500 at once.
@@ -280,25 +308,101 @@ def check_tickers_in_batches(tickers):
     return results
 
 
+def load_alert_state():
+    """Loads the remembered alert history so we don't repeat the same alert every day."""
+    try:
+        with open(ALERT_STATE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_alert_state(state):
+    """Saves alert history back to disk. The workflow commits this file to your repo."""
+    try:
+        with open(ALERT_STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"Could not save {ALERT_STATE_PATH} ({e}).")
+
+
+def load_sector_lookup():
+    """
+    Builds a Symbol -> Industry lookup from the NIFTY 500 CSV, so we can
+    check how concentrated your holdings are in any one sector.
+    """
+    try:
+        df = pd.read_csv(NIFTY_500_CSV_PATH)
+        return dict(zip(df["Symbol"].astype(str).str.strip(), df["Industry"].astype(str).str.strip()))
+    except Exception as e:
+        print(f"Could not load sector info from {NIFTY_500_CSV_PATH} ({e}).")
+        return {}
+
+
+def check_sector_concentration(holding_tickers):
+    """
+    Warns if too many of your holdings are in the same industry.
+    holding_tickers is a list of tickers like ['SBIN.NS', 'HDFCBANK.NS'].
+    """
+    if not holding_tickers:
+        return []
+
+    sector_lookup = load_sector_lookup()
+    if not sector_lookup:
+        return []
+
+    sector_counts = {}
+    for ticker in holding_tickers:
+        symbol = ticker.replace(".NS", "").replace(".BO", "")
+        sector = sector_lookup.get(symbol, "Unknown")
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+    total = len(holding_tickers)
+    warnings = []
+    for sector, count in sector_counts.items():
+        pct = (count / total) * 100
+        if pct >= SECTOR_CONCENTRATION_WARNING_PCT and sector != "Unknown":
+            warnings.append(
+                f"{pct:.0f}% of your holdings are in {sector} ({count} of {total} stocks) "
+                f"- consider diversifying"
+            )
+    return warnings
+
+
 def check_holdings():
     """
     Reads your holdings.csv (stocks you've actually bought) and checks
     today's price against your buy price. Returns a list of readable
-    status lines, e.g. "RELIANCE.NS: bought at 500.00, now 510.00
-    (+2.0%) - consider selling, target hit."
+    status lines. Also returns the list of holding tickers (for the
+    sector concentration check) and any sector warnings.
+
+    Behavior:
+    - Reports your live profit/loss on every holding, every run.
+    - First time a holding reaches the profit target: alerts you to sell
+      HALF the position and let the rest ride (partial profit booking).
+      After that, it won't repeat this specific alert again.
+    - Once partial profit is booked, the remaining half is tracked with a
+      trailing stop: if the price falls TRAILING_STOP_PCT from its peak,
+      you get one final alert to exit the rest.
+    - If a holding drops to your stop-loss (manual or default), you're
+      alerted once. It won't repeat this specific alert again.
     """
     try:
         df = pd.read_csv(HOLDINGS_CSV_PATH)
     except Exception as e:
         print(f"Could not read {HOLDINGS_CSV_PATH} ({e}). Skipping holdings check.")
-        return []
+        return [], [], []
 
     if df.empty:
-        return []
+        return [], [], []
 
+    state = load_alert_state()
     updates = []
+    holding_tickers = []
+
     for _, row in df.iterrows():
         ticker = str(row["Symbol"]).strip()
+        holding_tickers.append(ticker)
         try:
             buy_price = float(row["BuyPrice"])
         except (ValueError, TypeError):
@@ -309,12 +413,13 @@ def check_holdings():
         target = float(target) if pd.notna(target) and str(target).strip() != "" else None
         stop_loss = float(stop_loss) if pd.notna(stop_loss) and str(stop_loss).strip() != "" else None
 
-        # If no explicit TargetPrice was set, fall back to your default
-        # minimum profit percentage (e.g. 5%) so you always get a sell
-        # alert once a holding gains at least that much.
         using_default_target = target is None
         if using_default_target:
             target = buy_price * (1 + DEFAULT_PROFIT_TARGET_PCT / 100)
+
+        using_default_stop = stop_loss is None
+        if using_default_stop:
+            stop_loss = buy_price * (1 - DEFAULT_STOP_LOSS_PCT / 100)
 
         try:
             data = yf.download(ticker, period="5d", progress=False)
@@ -336,18 +441,55 @@ def check_holdings():
             f"({direction} {abs(change_pct):.1f}%)"
         )
 
-        if current_price >= target:
-            if using_default_target:
-                line += f" -- PROFIT TARGET REACHED ({DEFAULT_PROFIT_TARGET_PCT}%+ gain), consider selling"
-            else:
-                line += " -- TARGET REACHED, consider selling"
-        elif stop_loss is not None and current_price <= stop_loss:
-            line += " -- STOP-LOSS HIT, consider selling"
+        ticker_state = state.get(ticker, {})
+        alert_note = None
 
+        # ---- Stop-loss check (only before any partial profit is booked) ----
+        if not ticker_state.get("partial_sold") and current_price <= stop_loss:
+            if not ticker_state.get("stop_loss_alerted"):
+                label = "STOP-LOSS HIT" if not using_default_stop else f"STOP-LOSS HIT ({DEFAULT_STOP_LOSS_PCT}% default)"
+                alert_note = f" -- {label}, consider selling"
+                ticker_state["stop_loss_alerted"] = True
+            # if already alerted before, stay quiet (no repeat spam)
+
+        # ---- Profit target / partial booking check ----
+        elif not ticker_state.get("partial_sold") and current_price >= target:
+            label = "PROFIT TARGET REACHED" if using_default_target else "TARGET REACHED"
+            alert_note = (
+                f" -- {label} ({abs(change_pct):.1f}% gain) - sell HALF your position "
+                f"now, let the rest ride with a trailing stop"
+            )
+            ticker_state["partial_sold"] = True
+            ticker_state["trailing_peak"] = current_price
+            ticker_state["stop_loss_alerted"] = False  # reset, no longer relevant post-partial-sell
+
+        # ---- Trailing stop on the remaining half, after partial booking ----
+        elif ticker_state.get("partial_sold") and not ticker_state.get("trailing_stop_alerted"):
+            peak = max(ticker_state.get("trailing_peak", current_price), current_price)
+            ticker_state["trailing_peak"] = peak
+            drawdown_pct = ((peak - current_price) / peak) * 100
+            if drawdown_pct >= TRAILING_STOP_PCT:
+                alert_note = (
+                    f" -- TRAILING STOP HIT (fell {drawdown_pct:.1f}% from peak {peak:.2f}) "
+                    f"- consider selling your remaining position"
+                )
+                ticker_state["trailing_stop_alerted"] = True
+
+        if alert_note:
+            line += alert_note
+
+        state[ticker] = ticker_state
         updates.append(line)
         print(line)
 
-    return updates
+    save_alert_state(state)
+
+    sector_warnings = check_sector_concentration(holding_tickers)
+    for w in sector_warnings:
+        print(f"Sector check: {w}")
+
+    return updates, holding_tickers, sector_warnings
+
 
 
 def send_email(sections):
@@ -370,19 +512,22 @@ def main():
     alerts = [r for _, r in results if r]
 
     print("\n--- Your Holdings ---")
-    holdings_updates = check_holdings()
+    holdings_updates, holding_tickers, sector_warnings = check_holdings()
 
-    # Combine signal alerts and holdings updates into one email so you get
-    # both your watchlist signals and your portfolio status in one place.
+    # Combine signal alerts, holdings updates, and sector warnings into one
+    # email so you get your full picture in one place.
     email_sections = []
     if alerts:
         email_sections.append("SIGNALS TODAY:\n" + "\n".join(alerts))
     if holdings_updates:
         email_sections.append("YOUR HOLDINGS:\n" + "\n".join(holdings_updates))
+    if sector_warnings:
+        email_sections.append("DIVERSIFICATION CHECK:\n" + "\n".join(sector_warnings))
 
     if email_sections and EMAIL_FROM and EMAIL_PASSWORD and EMAIL_TO:
         send_email(email_sections)
-        print(f"\nEmail sent with {len(alerts)} signal(s) and {len(holdings_updates)} holdings update(s).")
+        print(f"\nEmail sent with {len(alerts)} signal(s), {len(holdings_updates)} holdings update(s), "
+              f"{len(sector_warnings)} sector warning(s).")
     elif email_sections:
         print("\nUpdates found but email isn't configured yet (see README.txt).")
     else:
