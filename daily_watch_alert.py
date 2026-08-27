@@ -32,7 +32,8 @@ USE_NIFTY_500 = True
 # repo (same folder as this script). Refresh it every few months by
 # re-downloading from https://archives.nseindia.com/content/indices/ind_nifty500list.csv
 # in your own browser and re-uploading it to the repo.
-NIFTY_500_CSV_PATH = "nifty500.csv"
+NIFTY_500_CSV_PATH = "ind_nifty500list.csv"
+
 
 # Only used if USE_NIFTY_500 is False
 MANUAL_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
