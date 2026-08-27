@@ -37,6 +37,16 @@ NIFTY_500_CSV_PATH = "ind_nifty500list.csv"
 # Only used if USE_NIFTY_500 is False
 MANUAL_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
 
+# ---- YOUR HOLDINGS (PORTFOLIO MEMORY) ----
+# Path to a CSV file where you record stocks you've actually bought, at what
+# price. The script re-reads this file every run and reports your live
+# profit/loss on each one. This file is your "memory" — edit it on GitHub
+# (pencil icon) whenever you buy or sell something. Columns:
+#   Symbol,BuyPrice,BuyDate,TargetPrice,StopLoss
+# TargetPrice and StopLoss are optional — leave blank if you don't want an
+# automatic sell alert at a specific price.
+HOLDINGS_CSV_PATH = "holdings.csv"
+
 # How many tickers to download from Yahoo Finance at once. Batching avoids
 # rate-limit errors and timeouts that can happen if you request 500 at once.
 BATCH_SIZE = 50
@@ -157,11 +167,71 @@ def check_tickers_in_batches(tickers):
     return results
 
 
-def send_email(alerts):
-    body = "Your daily stock watch triggered these signals:\n\n" + "\n".join(alerts)
+def check_holdings():
+    """
+    Reads your holdings.csv (stocks you've actually bought) and checks
+    today's price against your buy price. Returns a list of readable
+    status lines, e.g. "RELIANCE.NS: bought at 500.00, now 510.00
+    (+2.0%) - consider selling, target hit."
+    """
+    try:
+        df = pd.read_csv(HOLDINGS_CSV_PATH)
+    except Exception as e:
+        print(f"Could not read {HOLDINGS_CSV_PATH} ({e}). Skipping holdings check.")
+        return []
+
+    if df.empty:
+        return []
+
+    updates = []
+    for _, row in df.iterrows():
+        ticker = str(row["Symbol"]).strip()
+        try:
+            buy_price = float(row["BuyPrice"])
+        except (ValueError, TypeError):
+            continue
+
+        target = row.get("TargetPrice")
+        stop_loss = row.get("StopLoss")
+        target = float(target) if pd.notna(target) and str(target).strip() != "" else None
+        stop_loss = float(stop_loss) if pd.notna(stop_loss) and str(stop_loss).strip() != "" else None
+
+        try:
+            data = yf.download(ticker, period="5d", progress=False)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.get_level_values(0)
+            if data.empty:
+                print(f"{ticker}: no price data found for holdings check")
+                continue
+            current_price = float(data["Close"].iloc[-1])
+        except Exception as e:
+            print(f"{ticker}: error fetching price for holdings check ({e})")
+            continue
+
+        change_pct = ((current_price - buy_price) / buy_price) * 100
+        direction = "up" if change_pct >= 0 else "down"
+
+        line = (
+            f"{ticker}: bought at {buy_price:.2f}, now {current_price:.2f} "
+            f"({direction} {abs(change_pct):.1f}%)"
+        )
+
+        if target is not None and current_price >= target:
+            line += " -- TARGET REACHED, consider selling"
+        elif stop_loss is not None and current_price <= stop_loss:
+            line += " -- STOP-LOSS HIT, consider selling"
+
+        updates.append(line)
+        print(line)
+
+    return updates
+
+
+def send_email(sections):
+    body = "Your daily stock watch update:\n\n" + "\n\n".join(sections)
     body += "\n\nReminder: rule-based signal only, not financial advice."
     msg = MIMEText(body)
-    msg["Subject"] = f"Stock Alert: {len(alerts)} signal(s) today"
+    msg["Subject"] = "Stock Alert: Daily Update"
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
 
@@ -176,13 +246,24 @@ def main():
     results = check_tickers_in_batches(tickers)
     alerts = [r for _, r in results if r]
 
-    if alerts and EMAIL_FROM and EMAIL_PASSWORD and EMAIL_TO:
-        send_email(alerts)
-        print(f"\nEmail sent with {len(alerts)} alert(s).")
-    elif alerts:
-        print("\nSignals found but email isn't configured yet (see README.txt).")
+    print("\n--- Your Holdings ---")
+    holdings_updates = check_holdings()
+
+    # Combine signal alerts and holdings updates into one email so you get
+    # both your watchlist signals and your portfolio status in one place.
+    email_sections = []
+    if alerts:
+        email_sections.append("SIGNALS TODAY:\n" + "\n".join(alerts))
+    if holdings_updates:
+        email_sections.append("YOUR HOLDINGS:\n" + "\n".join(holdings_updates))
+
+    if email_sections and EMAIL_FROM and EMAIL_PASSWORD and EMAIL_TO:
+        send_email(email_sections)
+        print(f"\nEmail sent with {len(alerts)} signal(s) and {len(holdings_updates)} holdings update(s).")
+    elif email_sections:
+        print("\nUpdates found but email isn't configured yet (see README.txt).")
     else:
-        print("\nNo signals today — no email sent.")
+        print("\nNothing to report today — no email sent.")
 
 
 if __name__ == "__main__":
