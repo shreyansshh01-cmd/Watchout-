@@ -16,16 +16,23 @@ import os
 import time
 import smtplib
 from email.mime.text import MIMEText
-import requests
-import io
 import yfinance as yf
 import pandas as pd
 
 # ---- STOCK UNIVERSE ----
 # Set to True to automatically watch all ~500 stocks in the NIFTY 500 index
 # (a broad list covering large, mid, and small companies on the NSE).
+# This reads from a local file (NIFTY_500_CSV_PATH below) instead of
+# fetching from NSE live, because NSE blocks automated requests from cloud
+# servers like GitHub Actions. See README.txt for how to get/update this file.
 # Set to False to use your own manual list in MANUAL_TICKERS instead.
 USE_NIFTY_500 = True
+
+# Path to the NIFTY 500 list CSV, downloaded from NSE and committed to this
+# repo (same folder as this script). Refresh it every few months by
+# re-downloading from https://archives.nseindia.com/content/indices/ind_nifty500list.csv
+# in your own browser and re-uploading it to the repo.
+NIFTY_500_CSV_PATH = "nifty500.csv"
 
 # Only used if USE_NIFTY_500 is False
 MANUAL_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
@@ -48,33 +55,22 @@ EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM")
 EMAIL_PASSWORD = os.environ.get("ALERT_EMAIL_PASSWORD")  # Gmail "App Password"
 EMAIL_TO = os.environ.get("ALERT_EMAIL_TO")
 
-# NSE's official NIFTY 500 constituent list (updated periodically by NSE itself)
-NIFTY_500_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-
-
 def get_nifty500_tickers():
     """
-    Downloads the current NIFTY 500 list directly from NSE and converts the
-    symbols into Yahoo Finance format (e.g. RELIANCE -> RELIANCE.NS).
-    Falls back to the manual list if the download fails for any reason
-    (NSE occasionally blocks automated requests without proper headers).
+    Reads the NIFTY 500 list from a local CSV file committed to this repo
+    (downloaded manually from NSE, since NSE blocks live requests from cloud
+    servers such as GitHub Actions). Converts symbols into Yahoo Finance
+    format (e.g. RELIANCE -> RELIANCE.NS). Falls back to the manual list if
+    the file is missing or can't be read.
     """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36"
-        )
-    }
     try:
-        response = requests.get(NIFTY_500_URL, headers=headers, timeout=15)
-        response.raise_for_status()
-        df = pd.read_csv(io.StringIO(response.text))
+        df = pd.read_csv(NIFTY_500_CSV_PATH)
         symbols = df["Symbol"].astype(str).str.strip().tolist()
         tickers = [f"{sym}.NS" for sym in symbols]
-        print(f"Loaded {len(tickers)} tickers from NIFTY 500 list.")
+        print(f"Loaded {len(tickers)} tickers from {NIFTY_500_CSV_PATH}.")
         return tickers
     except Exception as e:
-        print(f"Could not fetch NIFTY 500 list ({e}). Falling back to manual list.")
+        print(f"Could not read {NIFTY_500_CSV_PATH} ({e}). Falling back to manual list.")
         return MANUAL_TICKERS
 
 
