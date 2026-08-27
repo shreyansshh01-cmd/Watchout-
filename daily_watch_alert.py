@@ -47,6 +47,13 @@ MANUAL_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
 # automatic sell alert at a specific price.
 HOLDINGS_CSV_PATH = "holdings.csv"
 
+# Minimum profit percentage you're happy to book automatically. If a
+# holding doesn't have a specific TargetPrice set in holdings.csv, this
+# percentage is used instead - so you always get a sell alert once a
+# holding gains at least this much, even if you never set a target price.
+# Also used to suggest a sell price alongside every new BUY signal below.
+DEFAULT_PROFIT_TARGET_PCT = 5
+
 # How many tickers to download from Yahoo Finance at once. Batching avoids
 # rate-limit errors and timeouts that can happen if you request 500 at once.
 BATCH_SIZE = 50
@@ -209,6 +216,15 @@ def evaluate_df(ticker, df):
     reason = "RSI overbought" if base_signal == "SELL" and latest["RSI"] > RSI_OVERBOUGHT else (
         "SMA crossed down" if base_signal == "SELL" else "SMA crossed up"
     )
+
+    if base_signal == "BUY":
+        suggested_sell = latest["Close"] * (1 + DEFAULT_PROFIT_TARGET_PCT / 100)
+        return (
+            f"{ticker}: BUY signal ({reason}) — buy price {latest['Close']:.2f}, "
+            f"suggested sell price {suggested_sell:.2f} (+{DEFAULT_PROFIT_TARGET_PCT}%) — "
+            f"RSI {latest['RSI']:.1f} — confirmed by: {confirmed_by}"
+        )
+
     return (
         f"{ticker}: {base_signal} signal ({reason}) — price {latest['Close']:.2f}, "
         f"RSI {latest['RSI']:.1f} — confirmed by: {confirmed_by}"
@@ -293,6 +309,13 @@ def check_holdings():
         target = float(target) if pd.notna(target) and str(target).strip() != "" else None
         stop_loss = float(stop_loss) if pd.notna(stop_loss) and str(stop_loss).strip() != "" else None
 
+        # If no explicit TargetPrice was set, fall back to your default
+        # minimum profit percentage (e.g. 5%) so you always get a sell
+        # alert once a holding gains at least that much.
+        using_default_target = target is None
+        if using_default_target:
+            target = buy_price * (1 + DEFAULT_PROFIT_TARGET_PCT / 100)
+
         try:
             data = yf.download(ticker, period="5d", progress=False)
             if isinstance(data.columns, pd.MultiIndex):
@@ -313,8 +336,11 @@ def check_holdings():
             f"({direction} {abs(change_pct):.1f}%)"
         )
 
-        if target is not None and current_price >= target:
-            line += " -- TARGET REACHED, consider selling"
+        if current_price >= target:
+            if using_default_target:
+                line += f" -- PROFIT TARGET REACHED ({DEFAULT_PROFIT_TARGET_PCT}%+ gain), consider selling"
+            else:
+                line += " -- TARGET REACHED, consider selling"
         elif stop_loss is not None and current_price <= stop_loss:
             line += " -- STOP-LOSS HIT, consider selling"
 
