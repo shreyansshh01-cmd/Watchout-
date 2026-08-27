@@ -2,9 +2,12 @@ name: Daily Stock Watch
 
 on:
   schedule:
-    # Runs at 10:00 AM IST (04:30 UTC) every weekday. Edit the time here if you want.
+    # Runs at 10:00 AM IST (04:30 UTC), Monday-Friday
     - cron: "30 4 * * 1-5"
-  workflow_dispatch: {}   # lets you also click "Run" manually on GitHub anytime
+  workflow_dispatch: {}   # lets you also run it manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can save alert_state.json back to the repo
 
 jobs:
   check-stocks:
@@ -22,8 +25,16 @@ jobs:
         run: pip install yfinance pandas
 
       - name: Run stock watch
+        run: python daily_watch_alert.py
         env:
           ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
           ALERT_EMAIL_PASSWORD: ${{ secrets.ALERT_EMAIL_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-        run: python daily_watch_alert.py
+
+      - name: Save alert memory
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add alert_state.json
+          git diff --staged --quiet || git commit -m "Update alert memory [skip ci]"
+          git push
