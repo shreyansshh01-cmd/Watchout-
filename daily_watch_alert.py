@@ -46,6 +46,10 @@ def compute_rsi(series, period=14):
 
 def check_ticker(ticker):
     df = yf.download(ticker, period="6mo", progress=False)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
     if df.empty or len(df) < SMA_SLOW + 2:
         return None
 
