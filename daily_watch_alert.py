@@ -58,6 +58,28 @@ SMA_SLOW = 50
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 
+# ---- ADDITIONAL "CHART READING" INDICATORS ----
+# These mimic what a trader would check on a TradingView-style chart beyond
+# just moving averages: momentum (MACD), volatility (Bollinger Bands), and
+# whether a move is backed by real trading activity (Volume). A signal only
+# counts as CONFIRMED when enough of these indicators agree, which cuts
+# down on false signals compared to using SMA/RSI alone.
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD_DEV = 2
+
+VOLUME_AVG_PERIOD = 20
+VOLUME_SURGE_MULTIPLIER = 1.5  # today's volume must be 1.5x the 20-day average to "confirm"
+
+# Minimum number of confirming indicators (out of MACD, Bollinger, Volume)
+# required, in addition to the base SMA/RSI signal, for a signal to be
+# reported. Lower = more signals but more false positives. Higher = fewer,
+# stronger signals.
+MIN_CONFIRMATIONS = 2
+
 # Email settings are read from environment variables (kept secret, set in
 # GitHub Actions "Secrets" — see README.txt). Never type your password
 # directly into this file.
@@ -94,15 +116,54 @@ def compute_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def compute_macd(series, fast=12, slow=26, signal=9):
+    """
+    MACD shows momentum: is the trend speeding up or slowing down.
+    Returns (macd_line, signal_line). A crossover of macd_line above
+    signal_line suggests strengthening upward momentum, and vice versa.
+    """
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
+
+
+def compute_bollinger_bands(series, period=20, std_dev=2):
+    """
+    Bollinger Bands show volatility: a price near the upper band is
+    "stretched" high (often overbought), near the lower band is
+    "stretched" low (often oversold).
+    """
+    middle = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    upper = middle + (std * std_dev)
+    lower = middle - (std * std_dev)
+    return upper, middle, lower
+
+
 def evaluate_df(ticker, df):
-    """Runs the SMA/RSI signal logic on a single ticker's price history."""
-    if df is None or df.empty or len(df) < SMA_SLOW + 2:
+    """
+    Runs the full signal logic on a single ticker's price history:
+    1. Base signal: SMA20/SMA50 crossover + RSI (same as before).
+    2. Confirmation check: MACD momentum, Bollinger Band position, and
+       Volume surge - like a trader cross-checking multiple parts of a
+       chart before acting on it.
+    A signal is only reported if the base signal fires AND at least
+    MIN_CONFIRMATIONS of the 3 confirming indicators agree.
+    """
+    if df is None or df.empty or len(df) < max(SMA_SLOW, MACD_SLOW, BOLLINGER_PERIOD) + 2:
         return None
 
     df = df.copy()
     df["SMA_fast"] = df["Close"].rolling(SMA_FAST).mean()
     df["SMA_slow"] = df["Close"].rolling(SMA_SLOW).mean()
     df["RSI"] = compute_rsi(df["Close"], RSI_PERIOD)
+    df["MACD"], df["MACD_signal"] = compute_macd(df["Close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    df["BB_upper"], df["BB_mid"], df["BB_lower"] = compute_bollinger_bands(
+        df["Close"], BOLLINGER_PERIOD, BOLLINGER_STD_DEV
+    )
+    df["Vol_avg"] = df["Volume"].rolling(VOLUME_AVG_PERIOD).mean()
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
@@ -110,12 +171,48 @@ def evaluate_df(ticker, df):
     crossed_up = (prev["SMA_fast"] <= prev["SMA_slow"]) and (latest["SMA_fast"] > latest["SMA_slow"])
     crossed_down = (prev["SMA_fast"] >= prev["SMA_slow"]) and (latest["SMA_fast"] < latest["SMA_slow"])
 
+    base_signal = None
     if crossed_up and latest["RSI"] < RSI_OVERBOUGHT:
-        return f"{ticker}: BUY signal — price {latest['Close']:.2f}, RSI {latest['RSI']:.1f}"
+        base_signal = "BUY"
     elif crossed_down or latest["RSI"] > RSI_OVERBOUGHT:
-        reason = "RSI overbought" if latest["RSI"] > RSI_OVERBOUGHT else "SMA crossed down"
-        return f"{ticker}: SELL signal ({reason}) — price {latest['Close']:.2f}, RSI {latest['RSI']:.1f}"
-    return None
+        base_signal = "SELL"
+
+    if base_signal is None:
+        return None
+
+    # ---- Confirmation checks ----
+    confirmations = []
+
+    # 1. MACD momentum agrees with the direction of the base signal
+    macd_bullish = latest["MACD"] > latest["MACD_signal"]
+    if (base_signal == "BUY" and macd_bullish) or (base_signal == "SELL" and not macd_bullish):
+        confirmations.append("MACD")
+
+    # 2. Bollinger Band position agrees (price stretched in the signal's direction)
+    if base_signal == "BUY" and latest["Close"] <= latest["BB_lower"] * 1.02:
+        confirmations.append("Bollinger")
+    elif base_signal == "SELL" and latest["Close"] >= latest["BB_upper"] * 0.98:
+        confirmations.append("Bollinger")
+
+    # 3. Volume surge - move is backed by real trading activity
+    volume_surge = (
+        pd.notna(latest["Vol_avg"]) and latest["Vol_avg"] > 0
+        and latest["Volume"] >= latest["Vol_avg"] * VOLUME_SURGE_MULTIPLIER
+    )
+    if volume_surge:
+        confirmations.append("Volume")
+
+    if len(confirmations) < MIN_CONFIRMATIONS:
+        return None
+
+    confirmed_by = ", ".join(confirmations)
+    reason = "RSI overbought" if base_signal == "SELL" and latest["RSI"] > RSI_OVERBOUGHT else (
+        "SMA crossed down" if base_signal == "SELL" else "SMA crossed up"
+    )
+    return (
+        f"{ticker}: {base_signal} signal ({reason}) — price {latest['Close']:.2f}, "
+        f"RSI {latest['RSI']:.1f} — confirmed by: {confirmed_by}"
+    )
 
 
 def check_tickers_in_batches(tickers):
