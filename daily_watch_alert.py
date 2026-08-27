@@ -34,7 +34,6 @@ USE_NIFTY_500 = True
 # in your own browser and re-uploading it to the repo.
 NIFTY_500_CSV_PATH = "ind_nifty500list.csv"
 
-
 # Only used if USE_NIFTY_500 is False
 MANUAL_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
 
@@ -147,7 +146,8 @@ def check_tickers_in_batches(tickers):
 
                 result = evaluate_df(ticker, df)
                 results.append((ticker, result))
-                print(result or f"{ticker}: no signal today")
+                if result:
+                    print(result)
             except Exception as e:
                 print(f"{ticker}: error processing ({e})")
 
